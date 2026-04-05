@@ -1,0 +1,1 @@
+web: gunicorn skin_ai:app
