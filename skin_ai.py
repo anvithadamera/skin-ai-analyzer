@@ -208,7 +208,8 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 <div class="container">
 
 <div class="left">
-<img src="/video_feed" width="90%"><br>
+<video id="video" autoplay playsinline width="90%"></video>
+<canvas id="canvas" style="display:none;"></canvas>
 
 <label>Does your skin get oily after 2-3 hrs?</label>
 <select id="oil"><option>No</option><option>Yes</option></select>
@@ -227,6 +228,15 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 </div>
 
 <script>
+const video = document.getElementById("video");
+
+navigator.mediaDevices.getUserMedia({ video: true })
+.then(stream => {
+    video.srcObject = stream;
+})
+.catch(err => {
+    alert("Camera access denied!");
+});
 function scan(){
 let s=document.getElementById("status");
 s.innerHTML="3...";
@@ -236,7 +246,29 @@ setTimeout(()=>{s.innerHTML="1...";},1400);
 setTimeout(()=>{
 s.innerHTML="📸 Capturing...";
 
-fetch('/capture',{
+let canvas = document.getElementById("canvas");
+let ctx = canvas.getContext("2d");
+
+canvas.width = video.videoWidth;
+canvas.height = video.videoHeight;
+
+ctx.drawImage(video, 0, 0);
+
+let imageData = canvas.toDataURL("image/jpeg");
+
+fetch('/analyze_frame',{
+method:"POST",
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({
+image: imageData,
+oily:document.getElementById("oil").value,
+dry:document.getElementById("dry").value
+})
+})
+.then(r=>r.json())
+.then(d=>{
+document.getElementById("result").innerHTML=d.html;
+});
 method:"POST",
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({
@@ -375,6 +407,44 @@ def capture():
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/analyze_frame', methods=['POST'])
+def analyze_frame():
+    data = request.json
+    img_data = data['image'].split(',')[1]
 
+    import base64
+    import io
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(base64.b64decode(img_data)))
+    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+    skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig = analyze(frame, data["oily"], data["dry"])
+
+    html=f"<h2>SKIN TYPE: {skin}</h2>"
+    html+=f"<h2>SKIN SCORE: {score}/100</h2>"
+    html+=f"<div style='background:#333;height:20px;border-radius:10px;'><div style='width:{score}%;background:lime;height:100%;'></div></div>"
+
+    if concerns:
+        html+="<h3>SKIN CONCERNS</h3><ul>"
+        html+=''.join(f"<li>{c}</li>" for c in concerns)
+        html+="</ul>"
+
+    html+="<h3>PRODUCT RECOMMENDATIONS</h3>"
+    for p in products[skin]:
+        html+=p+"<br>"
+
+    if "LIP PIGMENTATION 💄" in concerns:
+        html+="💄 Brightening SPF50 PA++++ Lip Balm<br>"
+    if "DARK CIRCLES 👁️" in concerns:
+        html+="👁️ Caffeine / Retinol Eye Cream<br>"
+
+    html+="<h3>DIET RECOMMENDATIONS</h3><ul>"
+    html+=''.join(f"<li>{d}</li>" for d in diet[skin])
+    html+="</ul>"
+
+    html+=f"<p>{roasts[skin]}</p>"
+
+    return jsonify({"html":html})
 if __name__=="__main__":
     app.run(debug=True)
