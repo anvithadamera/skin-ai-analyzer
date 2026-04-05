@@ -8,20 +8,24 @@ import time
 app = Flask(__name__)
 
 # -------- CAMERA --------
-camera = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
-if not camera.isOpened():
-    camera = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+import os
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-current_face = None
-scan_line = 0
+if os.environ.get("RENDER") == "true":
+    camera = None
+else:
+    camera = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
+    if not camera.isOpened():
+        camera = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 
 # -------- FRAME --------
 def get_frame():
+    if camera is None:
+        # return black dummy frame for Render
+        return np.zeros((480,640,3), dtype=np.uint8)
+
     ret, frame = camera.read()
     if not ret:
-        time.sleep(0.1)
+        time.sleep(0.2)
         ret, frame = camera.read()
     return frame
 
