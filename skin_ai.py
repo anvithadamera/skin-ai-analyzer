@@ -1,124 +1,53 @@
-# skin_ai_final_complete_ultra_FINAL.py
+# skin_ai_final_web_full.py
 
-from flask import Flask, render_template_string, Response, jsonify, request
+from flask import Flask, render_template_string, request, jsonify
+import base64
 import cv2
 import numpy as np
-import time
 
 app = Flask(__name__)
 
-# -------- CAMERA --------
-import os
-
-if os.environ.get("RENDER") == "true":
-    camera = None
-else:
-    camera = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
-    if not camera.isOpened():
-        camera = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-
-# -------- FRAME --------
-def get_frame():
-    if camera is None:
-        # return black dummy frame for Render
-        return np.zeros((480,640,3), dtype=np.uint8)
-
-    ret, frame = camera.read()
-    if not ret:
-        time.sleep(0.2)
-        ret, frame = camera.read()
-    return frame
-
-# -------- DETECT --------
-def detect_concerns(face):
-
-    face = cv2.bilateralFilter(face, 9, 75, 75)
-
-    hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-
-    kernel = np.ones((3,3), np.uint8)
-
-    acne_points = []
-    marks_points = []
-
-    red_mask = cv2.inRange(hsv,(0,150,120),(10,255,255)) + cv2.inRange(hsv,(170,150,120),(180,255,255))
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-
-    contours,_ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    acne = 0
-    for c in contours:
-        area = cv2.contourArea(c)
-        if 60 < area < 200:
-            peri = cv2.arcLength(c, True)
-            if peri == 0:
-                continue
-            circ = 4*np.pi*(area/(peri*peri))
-            if circ > 0.4:
-                acne += 1
-                x,y,w,h = cv2.boundingRect(c)
-                acne_points.append((x+w//2, y+h//2))
-
-    dark_mask = cv2.inRange(gray,0,50)
-
-    contours,_ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    marks = 0
-    for c in contours:
-        if 70 < cv2.contourArea(c) < 300:
-            marks += 1
-            x,y,wc,hc = cv2.boundingRect(c)
-            marks_points.append((x+wc//2, y+hc//2))
-
-    pigmentation = np.std(gray)
-
-    return acne, marks, pigmentation, gray, acne_points, marks_points
-
-# -------- ANALYZE --------
+# -------- ANALYSIS --------
 def analyze(face, oily, dry):
 
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
 
     texture = np.std(gray)
-    reflection = np.percentile(gray,95)
     brightness = np.mean(gray)
+    reflection = np.percentile(gray,95)
 
-    acne, marks, pigmentation, gray, acne_pts, marks_pts = detect_concerns(face)
+    # --- DETECTION ---
+    acne = np.sum(gray < 60) // 500
+    marks = np.sum(gray < 80) // 800
+    pigmentation = np.std(gray)
 
     h, w = gray.shape
 
+    # DARK CIRCLES
     eye = gray[int(0.45*h):int(0.65*h), int(0.3*w):int(0.7*w)]
-    cheek = gray[int(0.4*h):int(0.7*h), int(0.2*w):int(0.8*w)]
+    dark_circles = eye.size>0 and np.mean(eye) < brightness - 12
 
-    dark_circles = False
-    if eye.size>0 and cheek.size>0:
-        if np.mean(eye) < np.mean(cheek) - 12:
-            dark_circles = True
-
+    # LIP PIGMENTATION
     lips = gray[int(0.75*h):h, int(0.3*w):int(0.7*w)]
-    lip_pig = False
-    if lips.size>0 and np.mean(lips) < brightness - 15:
-        lip_pig = True
+    lip_pig = lips.size>0 and np.mean(lips) < brightness - 15
 
-    # ✅ FIXED SKIN TYPES
-    if oily == "Yes" and dry == "Yes":
-        skin = "Combination"
-    elif oily == "No" and dry == "No" and acne < 3 and marks < 3 and pigmentation < 10:
+    # SKIN TYPE
+    if reflection > 210:
+        skin = "Oily"
+    elif texture > 55:
+        skin = "Dry"
+    elif abs(reflection - texture) < 20:
         skin = "Normal"
     else:
-        if reflection > 200:
-            skin = "Oily"
-        elif texture > 55:
-            skin = "Dry"
-        else:
-            skin = "Combination"
+        skin = "Combination"
 
-    if texture > 65 and pigmentation > 15:
-        skin = "Sensitive"
+    if oily == "Yes" and skin != "Dry":
+        skin = "Oily"
+    if dry == "Yes" and skin != "Oily":
+        skin = "Dry"
 
+    # CONCERNS
     concerns = []
-
     if acne > 5:
         concerns.append("ACNE 🔴")
     if marks > 3:
@@ -130,6 +59,7 @@ def analyze(face, oily, dry):
     if lip_pig:
         concerns.append("LIP PIGMENTATION 💄")
 
+    # SCORE (YOUR LOGIC)
     score = 80
     if "ACNE 🔴" in concerns: score -= 15
     if "ACNE MARKS 🟤" in concerns: score -= 10
@@ -140,64 +70,40 @@ def analyze(face, oily, dry):
     if 120 < brightness < 170: score += 5
     score = max(40, min(score, 95))
 
-    return skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig
+    return skin, score, concerns
 
-# -------- VIDEO --------
-def generate_frames():
-    global current_face, scan_line
-
-    while True:
-        frame = get_frame()
-        frame = cv2.flip(frame,1)
-        display = frame.copy()
-
-        h_frame, w_frame, _ = frame.shape
-
-        # BIG SCAN AREA
-        box_w = int(w_frame * 0.6)
-        box_h = int(h_frame * 0.75)
-
-        x1 = int((w_frame - box_w) / 2)
-        y1 = int((h_frame - box_h) / 2)
-
-        x2 = x1 + box_w
-        y2 = y1 + box_h
-
-        roi = frame[y1:y2, x1:x2]
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray,1.3,5)
-
-        if len(faces)>0:
-            x,y,w,h = max(faces, key=lambda f: f[2]*f[3])
-            current_face = roi[y:y+h, x:x+w]
-
-            skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig = analyze(current_face,"No","No")
-
-            for (px,py) in acne_pts:
-                cv2.circle(display,(x1+x+px,y1+y+py),5,(0,0,255),-1)
-
-            for (px,py) in marks_pts:
-                cv2.circle(display,(x1+x+px,y1+y+py),5,(0,165,255),-1)
-
-        cv2.rectangle(display,(x1,y1),(x2,y2),(0,255,0),3)
-
-        _,buffer=cv2.imencode('.jpg',display)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+buffer.tobytes()+b'\r\n')
 
 # -------- UI --------
 @app.route('/')
 def index():
     return render_template_string("""
+
 <html>
 <head>
 <style>
-body{margin:0;background:#0f2027;color:white;font-family:Arial;}
-.container{display:flex;height:100vh;}
-.left{width:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;}
-.right{width:50%;padding:30px;background:rgba(255,255,255,0.05);overflow:auto;}
-h2,h3{text-decoration:underline;}
-button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;border:none;}
+body{
+background:linear-gradient(135deg,#1e1e2f,#0f2027);
+color:white;font-family:Arial;
+}
+.container{display:flex;height:90vh;}
+.left{width:50%;padding:20px;text-align:center;}
+.right{width:50%;padding:20px;overflow:auto;}
+
+video{
+width:90%;
+border-radius:15px;
+}
+
+.card{
+background:rgba(255,255,255,0.05);
+padding:15px;
+border-radius:15px;
+}
+
+button{
+background:linear-gradient(45deg,#00c6ff,#0072ff);
+border:none;padding:10px 20px;border-radius:20px;color:white;
+}
 </style>
 </head>
 
@@ -207,103 +113,97 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 
 <div class="container">
 
-<div class="left">
-<video id="video" autoplay playsinline width="90%"></video>
-<canvas id="canvas" style="display:none;"></canvas>
+<div class="left card">
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas" style="display:none;"></canvas><br><br>
 
-<label>Does your skin get oily after 2-3 hrs?</label>
-<select id="oil"><option>No</option><option>Yes</option></select>
+<label>Does your skin get oily after 2-3 hrs?</label><br>
+<select id="oil"><option>No</option><option>Yes</option></select><br><br>
 
-<label>Do you have dry patches?</label>
-<select id="dry"><option>No</option><option>Yes</option></select>
+<label>Do you have dry patches?</label><br>
+<select id="dry"><option>No</option><option>Yes</option></select><br><br>
 
 <button onclick="scan()">SCAN</button>
 <p id="status"></p>
+
 </div>
 
-<div class="right" id="result">
+<div class="right card" id="result">
 <h2>RESULT</h2>
 </div>
 
 </div>
 
 <script>
+
 const video = document.getElementById("video");
 
 navigator.mediaDevices.getUserMedia({ video: true })
 .then(stream => {
     video.srcObject = stream;
 })
-.catch(err => {
-    alert("Camera access denied!");
-});
+.catch(err => alert("Camera permission needed"));
+
 function scan(){
+
 let s=document.getElementById("status");
+
 s.innerHTML="3...";
 setTimeout(()=>{s.innerHTML="2...";},700);
 setTimeout(()=>{s.innerHTML="1...";},1400);
 
 setTimeout(()=>{
-s.innerHTML="📸 Capturing...";
 
-let canvas = document.getElementById("canvas");
-let ctx = canvas.getContext("2d");
+let canvas=document.getElementById("canvas");
+let ctx=canvas.getContext("2d");
 
-canvas.width = video.videoWidth;
-canvas.height = video.videoHeight;
+canvas.width=video.videoWidth;
+canvas.height=video.videoHeight;
 
-ctx.drawImage(video, 0, 0);
+ctx.drawImage(video,0,0);
 
-let imageData = canvas.toDataURL("image/jpeg");
+let img=canvas.toDataURL("image/jpeg");
 
-fetch('/analyze_frame',{
+fetch('/analyze',{
 method:"POST",
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({
-image: imageData,
+image:img,
 oily:document.getElementById("oil").value,
 dry:document.getElementById("dry").value
 })
 })
 .then(r=>r.json())
 .then(d=>{
-document.getElementById("result").innerHTML=d.html;
-});
-method:"POST",
-headers:{'Content-Type':'application/json'},
-body:JSON.stringify({
-oily:document.getElementById("oil").value,
-dry:document.getElementById("dry").value
-})
-})
-.then(r=>r.json())
-.then(d=>{
-s.innerHTML="🧠 Analyzing...";
-setTimeout(()=>{
 document.getElementById("result").innerHTML=d.html;
 s.innerHTML="✅ Done";
-},1200);
 });
+
 },2100);
 }
+
 </script>
 
 </body>
 </html>
+
 """)
 
 # -------- CAPTURE --------
-@app.route('/capture', methods=['POST'])
+@app.route('/analyze', methods=['POST'])
 def capture():
-    global current_face
-
-    if current_face is None:
-        return jsonify({"html":"⚠️ NO FACE DETECTED"})
 
     data = request.json
 
-    skin, score, concerns, _, _, _, _ = analyze(current_face, data["oily"], data["dry"])
+    img_data = data["image"].split(',')[1]
+    img = base64.b64decode(img_data)
 
+    npimg = np.frombuffer(img, np.uint8)
+    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    skin, score, concerns = analyze(frame, data["oily"], data["dry"])
+
+    # PRODUCTS
     products = {
         "Dry":[
             "🧼 Hydrating Cleanser",
@@ -328,15 +228,10 @@ def capture():
             "💧 Vitamin C/Niacinamide",
             "🧴 Light Moisturizer",
             "☀️ Sunscreen (UV Doux/Cetaphil)"
-        ],
-        "Sensitive":[
-            "🧼 Gentle Fragrance-Free Cleanser",
-            "💧 Aloe/Panthenol Serum",
-            "🧴 Barrier Repair Moisturizer",
-            "☀️ Mineral Sunscreen"
         ]
     }
 
+    # DIET
     diet = {
         "Dry":[
             "💧 Drink at least 2-3 liters of water daily",
@@ -361,21 +256,15 @@ def capture():
             "🥗 Eat vitamin-rich foods",
             "🍽️ Maintain balanced diet",
             "🚫 Avoid excess junk or sugar"
-        ],
-        "Sensitive":[
-            "🌿 Eat anti-inflammatory foods (turmeric, ginger)",
-            "🥛 Include probiotics (curd, yogurt)",
-            "🚫 Avoid spicy processed foods",
-            "🍓 Eat antioxidant-rich foods (berries, leafy greens)"
         ]
     }
 
+    # ROASTS
     roasts = {
         "Dry":"💀 YOUR SKIN IS SO DRY, IT'S LITERALLY SCREAMING FOR HYDRATION 💧",
         "Oily":"😭 YOUR SKIN LOVES TO BE EXTRA, A LITTLE TOO EXTRA OILY 🛢️",
         "Combination":"😵‍💫 YOUR SKIN CAN'T DECIDE WHAT IT WANTS",
-        "Normal":"😎 YOUR SKIN IS SO UNPROBLEMATIC, IT'S HONESTLY HELLACIOUS ✨",
-        "Sensitive":"⚡ YOUR SKIN REACTS FASTER THAN YOU IN ARGUMENTS 😭"
+        "Normal":"😎 YOUR SKIN IS SO UNPROBLEMATIC, IT'S HONESTLY HELLACIOUS ✨"
     }
 
     html=f"<h2>SKIN TYPE: {skin}</h2>"
@@ -404,47 +293,6 @@ def capture():
 
     return jsonify({"html":html})
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-@app.route('/analyze_frame', methods=['POST'])
-def analyze_frame():
-    data = request.json
-    img_data = data['image'].split(',')[1]
 
-    import base64
-    import io
-    from PIL import Image
-
-    image = Image.open(io.BytesIO(base64.b64decode(img_data)))
-    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-
-    skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig = analyze(frame, data["oily"], data["dry"])
-
-    html=f"<h2>SKIN TYPE: {skin}</h2>"
-    html+=f"<h2>SKIN SCORE: {score}/100</h2>"
-    html+=f"<div style='background:#333;height:20px;border-radius:10px;'><div style='width:{score}%;background:lime;height:100%;'></div></div>"
-
-    if concerns:
-        html+="<h3>SKIN CONCERNS</h3><ul>"
-        html+=''.join(f"<li>{c}</li>" for c in concerns)
-        html+="</ul>"
-
-    html+="<h3>PRODUCT RECOMMENDATIONS</h3>"
-    for p in products[skin]:
-        html+=p+"<br>"
-
-    if "LIP PIGMENTATION 💄" in concerns:
-        html+="💄 Brightening SPF50 PA++++ Lip Balm<br>"
-    if "DARK CIRCLES 👁️" in concerns:
-        html+="👁️ Caffeine / Retinol Eye Cream<br>"
-
-    html+="<h3>DIET RECOMMENDATIONS</h3><ul>"
-    html+=''.join(f"<li>{d}</li>" for d in diet[skin])
-    html+="</ul>"
-
-    html+=f"<p>{roasts[skin]}</p>"
-
-    return jsonify({"html":html})
 if __name__=="__main__":
-    app.run(debug=True)
+    app.run()
