@@ -1,32 +1,14 @@
-# skin_ai_dermatology_FULL_FINAL.py
+# skin_ai_dermatology_MOBILE.py
 
 from flask import Flask, render_template_string, Response, jsonify, request
 import cv2
 import numpy as np
+import base64
 import time
 
 app = Flask(__name__)
 
-# -------- CAMERA --------
-camera = cv2.VideoCapture(0)  # Default camera for cross-device access
-
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-current_face = None
-scan_line = 0
-
-# -------- FRAME --------
-def get_frame():
-    ret, frame = camera.read()
-    if not ret:
-        time.sleep(0.1)
-        ret, frame = camera.read()
-
-    # 🔥 REMOVE BEAUTIFICATION (sharpen image)
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    frame = cv2.filter2D(frame, -1, kernel)
-
-    return frame
 
 # -------- DETECT --------
 def detect_concerns(face):
@@ -42,7 +24,7 @@ def detect_concerns(face):
     acne_points = []
     marks_points = []
 
-    # STRICT FACE REGION (avoid lips/edges)
+    # STRICT FACE REGION
     roi_mask = np.zeros_like(gray)
     cv2.rectangle(roi_mask, (int(0.15*w), int(0.1*h)), (int(0.85*w), int(0.75*h)), 255, -1)
 
@@ -133,7 +115,7 @@ def analyze(face, oily, dry):
     if lips.size>0 and np.mean(lips) < brightness - 15:
         lip_pig = True
 
-    # SKIN TYPE LOGIC FIXED
+    # SKIN TYPE (HYBRID)
     if oily == "Yes" and dry == "Yes":
         skin = "Combination"
     elif reflection > 200:
@@ -141,7 +123,7 @@ def analyze(face, oily, dry):
     elif dryness > 20:
         skin = "Dry"
     else:
-        skin = "Normal"
+        skin = "Combination"
 
     if texture > 65 and pigmentation > 15:
         skin = "Sensitive"
@@ -184,54 +166,6 @@ def analyze(face, oily, dry):
 
     return skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig, explanations, confidence, lighting_msg
 
-# -------- VIDEO --------
-def generate_frames():
-    global current_face, scan_line
-
-    while True:
-        frame = get_frame()
-        frame = cv2.flip(frame,1)
-        display = frame.copy()
-
-        h_frame, w_frame, _ = frame.shape
-
-        box_w = int(w_frame * 0.6)
-        box_h = int(h_frame * 0.75)
-
-        x1 = int((w_frame - box_w) / 2)
-        y1 = int((h_frame - box_h) / 2)
-
-        x2 = x1 + box_w
-        y2 = y1 + box_h
-
-        roi = frame[y1:y2, x1:x2]
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray,1.3,5)
-
-        if len(faces)>0:
-            x,y,w,h = max(faces, key=lambda f: f[2]*f[3])
-            current_face = roi[y:y+h, x:x+w]
-
-            skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig, explanations, confidence, lighting_msg = analyze(current_face,"No","No")
-
-            # DRAW ACNE
-            for (px,py) in acne_pts:
-                cv2.circle(display,(x1+x+px,y1+y+py),6,(0,0,255),2)
-
-            # MARKS
-            for (px,py) in marks_pts:
-                cv2.circle(display,(x1+x+px,y1+y+py),6,(0,165,255),2)
-
-            # ANIME SCAN LINE
-            scan_line = (scan_line + 10) % (y2-y1)
-            cv2.line(display,(x1,y1+scan_line),(x2,y1+scan_line),(255,255,0),2)
-
-        cv2.rectangle(display,(x1,y1),(x2,y2),(0,255,0),3)
-
-        _,buffer=cv2.imencode('.jpg',display)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+buffer.tobytes()+b'\r\n')
-
 # -------- UI --------
 @app.route('/')
 def index():
@@ -245,6 +179,7 @@ body{margin:0;background:#0f2027;color:white;font-family:Arial;}
 .right{width:50%;padding:30px;background:rgba(255,255,255,0.05);overflow:auto;}
 h2,h3{text-decoration:underline;}
 button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;border:none;}
+video{border-radius:12px;}
 </style>
 </head>
 
@@ -255,7 +190,7 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 <div class="container">
 
 <div class="left">
-<img src="/video_feed" width="90%"><br>
+<video id="video" width="90%" autoplay playsinline></video><br>
 
 <label>Does your skin get oily after 2-3 hrs?</label>
 <select id="oil"><option>No</option><option>Yes</option></select>
@@ -265,6 +200,7 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 
 <button onclick="scan()">SCAN</button>
 <p id="status"></p>
+<canvas id="snap" style="display:none;"></canvas>
 </div>
 
 <div class="right" id="result">
@@ -274,6 +210,11 @@ button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;borde
 </div>
 
 <script>
+const video=document.getElementById('video');
+navigator.mediaDevices.getUserMedia({video:true})
+.then(stream=>{video.srcObject=stream;})
+.catch(err=>{alert("Camera access denied or unavailable.")});
+
 function scan(){
 let s=document.getElementById("status");
 s.innerHTML="3...";
@@ -282,13 +223,20 @@ setTimeout(()=>{s.innerHTML="1...";},1400);
 
 setTimeout(()=>{
 s.innerHTML="📸 Capturing...";
+let canvas=document.getElementById("snap");
+canvas.width=video.videoWidth;
+canvas.height=video.videoHeight;
+let ctx=canvas.getContext("2d");
+ctx.drawImage(video,0,0,canvas.width,canvas.height);
+let dataURL=canvas.toDataURL('image/jpeg');
 
 fetch('/capture',{
 method:"POST",
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({
 oily:document.getElementById("oil").value,
-dry:document.getElementById("dry").value
+dry:document.getElementById("dry").value,
+image:dataURL
 })
 })
 .then(r=>r.json())
@@ -310,14 +258,20 @@ s.innerHTML="✅ Done";
 # -------- CAPTURE --------
 @app.route('/capture', methods=['POST'])
 def capture():
-    global current_face
-
-    if current_face is None:
-        return jsonify({"html":"⚠️ NO FACE DETECTED"})
-
     data = request.json
 
-    skin, score, concerns, _, _, _, _, explanations, confidence, lighting_msg = analyze(current_face, data["oily"], data["dry"])
+    if "image" not in data:
+        return jsonify({"html":"⚠️ NO IMAGE CAPTURED"})
+
+    img_data = data["image"].split(",")[1]
+    img_bytes = base64.b64decode(img_data)
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    face = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if face is None:
+        return jsonify({"html":"⚠️ INVALID IMAGE"})
+
+    skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig, explanations, confidence, lighting_msg = analyze(face, data["oily"], data["dry"])
 
     products = {
         "Dry":[
@@ -428,10 +382,6 @@ def capture():
     html+=f"<p>{roasts[skin]}</p>"
 
     return jsonify({"html":html})
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__=="__main__":
     app.run(debug=True)
