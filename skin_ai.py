@@ -1,287 +1,290 @@
-# skin_ai_dermatology_browser.py
+# =========================
+# SKIN AI (ULTIMATE PRO STABLE VERSION)
+# =========================
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import cv2
 import numpy as np
 import base64
+import hashlib
 import time
 
 app = Flask(__name__)
 
-# -------- FACE DETECTION --------
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# -------- FRAME PROCESSING FUNCTIONS --------
-def decode_base64_image(data_url):
-    try:
-        header, encoded = data_url.split(",", 1)
-        data = base64.b64decode(encoded)
-        nparr = np.frombuffer(data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        return img
-    except Exception as e:
-        print("Error decoding base64:", e)
-        return None
+# -------- LOCK --------
+last_face_hash = None
+last_result = None
 
-def detect_concerns(face):
-    face = cv2.bilateralFilter(face, 9, 75, 75)
-    hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+def get_face_hash(face):
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray,(50,50))
+    small = cv2.GaussianBlur(small,(5,5),0)
+    return hashlib.md5(small.tobytes()).hexdigest()
 
-    h, w = gray.shape
-    kernel = np.ones((3,3), np.uint8)
-    acne_points = []
-    marks_points = []
+# -------- ANALYSIS (UNCHANGED) --------
+def analyze(faces, oily_input, dry_input):
+    global last_face_hash, last_result
 
-    roi_mask = np.zeros_like(gray)
-    cv2.rectangle(roi_mask, (int(0.15*w), int(0.1*h)), (int(0.85*w), int(0.75*h)), 255, -1)
+    face_hash = get_face_hash(faces[0])
+    if last_face_hash and face_hash[:20] == last_face_hash[:20]:
+        return last_result
 
-    # ACNE DETECTION
-    red_mask = cv2.inRange(hsv,(0,150,120),(10,255,255)) + cv2.inRange(hsv,(170,150,120),(180,255,255))
-    red_mask = cv2.bitwise_and(red_mask, roi_mask)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-    contours,_ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    acne = 0
-    for c in contours:
-        area = cv2.contourArea(c)
-        if 80 < area < 250:
-            peri = cv2.arcLength(c, True)
-            if peri == 0:
-                continue
-            circ = 4*np.pi*(area/(peri*peri))
-            if circ > 0.5:
-                acne += 1
-                x,y,wc,hc = cv2.boundingRect(c)
-                acne_points.append((x+wc//2, y+hc//2))
+    f_oil_vals, cheek_tex_vals, cheek_edge_vals, chin_oil_vals = [], [], [], []
+    acne_count = 0
+    marks_score = 0
+    dark_votes, lip_votes = 0, 0
 
-    # PIGMENTATION
-    grid_size = 6
-    patch_vals = []
-    for i in range(grid_size):
-        for j in range(grid_size):
-            patch = gray[int(i*h/grid_size):int((i+1)*h/grid_size),
-                         int(j*w/grid_size):int((j+1)*w/grid_size)]
-            if patch.size > 0:
-                patch_vals.append(np.mean(patch))
-    pigmentation = np.std(patch_vals)
+    for face in faces:
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
 
-    # MARKS
-    dark_mask = cv2.inRange(gray,0,50)
-    contours,_ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    marks = 0
-    for c in contours:
-        if 80 < cv2.contourArea(c) < 300:
-            marks += 1
-            x,y,wc,hc = cv2.boundingRect(c)
-            marks_points.append((x+wc//2, y+hc//2))
+        h,w = gray.shape
 
-    return acne, marks, pigmentation, gray, acne_points, marks_points
+        forehead = gray[0:int(0.3*h), int(0.3*w):int(0.7*w)]
+        cheek_l = gray[int(0.4*h):int(0.7*h), 0:int(0.4*w)]
+        cheek_r = gray[int(0.4*h):int(0.7*h), int(0.6*w):w]
+        chin = gray[int(0.7*h):h, int(0.3*w):int(0.7*w)]
 
-def analyze(face, oily, dry):
-    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    texture = np.std(gray)
-    brightness = np.mean(gray)
+        cheeks = np.concatenate((cheek_l.flatten(), cheek_r.flatten()))
 
-    lighting_msg = None
-    if brightness < 70:
-        lighting_msg = "⚠️ Low lighting detected"
-    elif brightness > 200:
-        lighting_msg = "⚠️ Overexposed lighting detected"
+        f_oil_vals.append(np.percentile(forehead,95))
+        cheek_tex_vals.append(np.std(cheeks))
+        cheek_edge_vals.append(np.mean(cv2.Canny(cheeks.reshape(-1,1),50,150)))
+        chin_oil_vals.append(np.percentile(chin,95))
 
-    edges = cv2.Canny(gray,50,150)
-    dryness = np.mean(edges)
+        # ACNE
+        red_mask = cv2.inRange(hsv,(0,120,120),(10,255,255)) + \
+                   cv2.inRange(hsv,(170,120,120),(180,255,255))
+        contours,_ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    h, w = gray.shape
-    tzone = gray[int(0.1*h):int(0.4*h), int(0.3*w):int(0.7*w)]
-    reflection = np.percentile(tzone,95)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if 60 < area < 250:
+                peri = cv2.arcLength(c,True)
+                if peri == 0:
+                    continue
+                circ = 4*np.pi*(area/(peri*peri))
+                if circ > 0.5:
+                    acne_count += 1
 
-    acne, marks, pigmentation, gray, acne_pts, marks_pts = detect_concerns(face)
+        # MARKS
+        dark_mask = cv2.inRange(gray, 0, 60)
+        contours,_ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            if 80 < cv2.contourArea(c) < 400:
+                marks_score += 1
 
-    # DARK CIRCLES
-    eye = gray[int(0.45*h):int(0.65*h), int(0.3*w):int(0.7*w)]
-    cheek = gray[int(0.4*h):int(0.7*h), int(0.2*w):int(0.8*w)]
-    dark_circles = False
-    if eye.size>0 and cheek.size>0:
-        if np.mean(eye) < np.mean(cheek) - 12:
-            dark_circles = True
+        # DARK CIRCLES
+        eye = gray[int(0.45*h):int(0.65*h), int(0.3*w):int(0.7*w)]
+        cheek_ref = gray[int(0.4*h):int(0.7*h), int(0.2*w):int(0.8*w)]
+        if np.mean(eye) < np.mean(cheek_ref) - 15:
+            dark_votes += 1
 
-    # LIP PIGMENTATION
-    lips = gray[int(0.75*h):h, int(0.3*w):int(0.7*w)]
-    lip_pig = False
-    if lips.size>0 and np.mean(lips) < brightness - 15:
-        lip_pig = True
+        # LIP
+        lips = gray[int(0.75*h):h, int(0.3*w):int(0.7*w)]
+        if np.mean(lips) < np.mean(gray) - 18:
+            lip_votes += 1
 
-    # SKIN TYPE
-    if oily=="Yes" and dry=="Yes":
-        skin="Combination"
-    elif reflection>200:
-        skin="Oily"
-    elif dryness>20:
-        skin="Dry"
+    f_oil = np.mean(f_oil_vals)
+    cheek_tex = np.mean(cheek_tex_vals)
+    cheek_edges = np.mean(cheek_edge_vals)
+    chin_oil = np.mean(chin_oil_vals)
+
+    if f_oil > 185 and cheek_edges < 20:
+        skin = "Oily"
+    elif f_oil > 170 and cheek_edges > 22:
+        skin = "Combination"
+    elif cheek_edges > 25:
+        skin = "Dry"
     else:
-        skin="Normal"
+        skin = "Normal"
 
-    if texture>65 and pigmentation>15:
-        skin="Sensitive"
+    if oily_input == "Yes" and skin == "Normal":
+        skin = "Combination"
+    if dry_input == "Yes" and skin == "Normal":
+        skin = "Dry"
 
-    # CONCERNS & EXPLANATIONS
-    concerns=[]
-    explanations=[]
-    if acne>5:
+    concerns = []
+    explanations = []
+
+    if acne_count >= 4:
         concerns.append("ACNE 🔴")
-        explanations.append("Inflammatory acne lesions detected via red pixel clustering")
-    if marks>3:
+        explanations.append("Inflamed acne clusters detected")
+
+    if marks_score >= 5:
         concerns.append("ACNE MARKS 🟤")
-        explanations.append("Post-inflammatory hyperpigmentation detected")
-    if pigmentation>12:
+        explanations.append("Post-acne scars detected")
+
+    if abs(f_oil - chin_oil) + cheek_tex > 70:
         concerns.append("PIGMENTATION ⚫")
-        explanations.append("Uneven melanin distribution observed")
-    if dark_circles:
+        explanations.append("Uneven tone detected")
+
+    if dark_votes > len(faces)//2:
         concerns.append("DARK CIRCLES 👁️")
-        explanations.append("Periorbital darkening detected")
-    if lip_pig:
+        explanations.append("Under-eye darker than cheeks")
+
+    if lip_votes > len(faces)//2:
         concerns.append("LIP PIGMENTATION 💄")
-        explanations.append("Lip tone darker than baseline")
+        explanations.append("Lip darker than skin")
 
-    # SCORE & CONFIDENCE
-    score=100
-    score -= acne*2
-    score -= marks*2
-    score -= int(pigmentation)
-    score -= int(dryness/5)
-    score = max(40, min(score,95))
-    confidence = min(95, int((len(acne_pts)+len(marks_pts))/10*100))
+    score = int(75 - (cheek_tex/5 + cheek_edges/6))
+    score = max(60, min(80, score))
 
-    return skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig, explanations, confidence, lighting_msg
+    result = (skin, score, concerns, explanations)
 
-# -------- ROUTES --------
+    last_face_hash = face_hash
+    last_result = result
+
+    return result
+
+
+# -------- UI --------
 @app.route('/')
 def index():
     return render_template_string("""
 <html>
-<head>
-<style>
-body{margin:0;background:#0f2027;color:white;font-family:Arial;}
-.container{display:flex;height:100vh;}
-.left{width:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;}
-.right{width:50%;padding:30px;background:rgba(255,255,255,0.05);overflow:auto;}
-h2,h3{text-decoration:underline;}
-button{padding:12px 25px;border-radius:20px;background:#00c6ff;color:white;border:none;}
-video{border:3px solid #00ff00;border-radius:10px;}
-</style>
-</head>
-<body>
-<h1 style="text-align:center;">✨ SKIN AI ANALYZER ✨</h1>
-<div class="container">
-<div class="left">
-<video id="video" width="90%" autoplay playsinline></video><br>
-<label>Does your skin get oily after 2-3 hrs?</label>
+<body style="background:#0f2027;color:white;text-align:center;font-family:Arial;">
+
+<h1>✨ SKIN AI ANALYZER ✨</h1>
+
+<video id="video" autoplay playsinline width="90%"></video>
+<canvas id="canvas" style="display:none;"></canvas>
+
+<br><br>
+
+<label>Oily after 2-3 hrs?</label>
 <select id="oil"><option>No</option><option>Yes</option></select>
-<label>Do you have dry patches?</label>
+
+<label>Dry patches?</label>
 <select id="dry"><option>No</option><option>Yes</option></select>
+
+<br><br>
+
 <button onclick="scan()">SCAN</button>
 <p id="status"></p>
-</div>
-<div class="right" id="result">
-<h2>RESULT</h2>
-</div>
-</div>
+
+<div id="result"></div>
+
 <script>
-const video=document.getElementById('video');
-navigator.mediaDevices.getUserMedia({video:true}).then(stream=>{video.srcObject=stream;});
+const video = document.getElementById("video");
+
+navigator.mediaDevices.getUserMedia({ video: true })
+.then(stream => { video.srcObject = stream; });
+
+function capture(){
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video,0,0);
+    return canvas.toDataURL("image/jpeg");
+}
 
 function scan(){
 let s=document.getElementById("status");
-s.innerHTML="3...";
-setTimeout(()=>{s.innerHTML="2...";},700);
-setTimeout(()=>{s.innerHTML="1...";},1400);
-setTimeout(()=>{
-s.innerHTML="📸 Capturing...";
-const canvas=document.createElement('canvas');
-canvas.width=video.videoWidth; canvas.height=video.videoHeight;
-const ctx=canvas.getContext('2d');
-ctx.drawImage(video,0,0,canvas.width,canvas.height);
-const dataURL=canvas.toDataURL('image/jpeg');
+
+let frames=[];
+let count=0;
+
+let interval=setInterval(()=>{
+frames.push(capture());
+count++;
+
+s.innerHTML="📸 Capturing "+count+"/5";
+
+if(count==5){
+clearInterval(interval);
 
 fetch('/capture',{
 method:"POST",
 headers:{'Content-Type':'application/json'},
-body:JSON.stringify({frame:dataURL,oily:document.getElementById("oil").value,dry:document.getElementById("dry").value})
+body:JSON.stringify({
+frames:frames,
+oily:document.getElementById("oil").value,
+dry:document.getElementById("dry").value
+})
 })
 .then(r=>r.json())
 .then(d=>{
-s.innerHTML="🧠 Analyzing...";
-setTimeout(()=>{
 document.getElementById("result").innerHTML=d.html;
-s.innerHTML="✅ Done";
-},1200);
+s.innerHTML="🔒 RESULT LOCKED ✅";
 });
-},2100);
+}
+},200);
 }
 </script>
+
 </body>
 </html>
 """)
 
+
+# -------- CAPTURE --------
 @app.route('/capture', methods=['POST'])
 def capture():
-    data=request.json
-    frame = decode_base64_image(data["frame"])
-    if frame is None:
-        return jsonify({"html":"⚠️ FAILED TO CAPTURE FRAME"})
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray,1.3,5)
+    data = request.json
+
+    faces = []
+
+    for img in data["frames"]:
+        image_data = img.split(',')[1]
+        nparr = np.frombuffer(base64.b64decode(image_data), np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        det = face_cascade.detectMultiScale(gray,1.3,5)
+
+        if len(det)>0:
+            x,y,w,h = max(det, key=lambda f:f[2]*f[3])
+            faces.append(frame[y:y+h, x:x+w])
+
     if len(faces)==0:
         return jsonify({"html":"⚠️ NO FACE DETECTED"})
-    x,y,w,h=max(faces,key=lambda f:f[2]*f[3])
-    face=frame[y:y+h, x:x+w]
 
-    skin, score, concerns, acne_pts, marks_pts, dark_circles, lip_pig, explanations, confidence, lighting_msg = analyze(face,data["oily"],data["dry"])
+    skin,score,concerns,explanations = analyze(faces,data["oily"],data["dry"])
 
     products = {
-        "Dry":["🧼 Hydrating Cleanser","💧 Hyaluronic/Glycerin Serum","🧴 Ceramide Moisturizer (Episoft AC / Cetaphil)","☀️ Cream Sunscreen (UV Doux / Cetaphil)"],
-        "Oily":["🧼 Gel/Foamy Cleanser","💧 Niacinamide Serum","🧴 Lightweight Gel Moisturizer (Sebamed)","☀️ Matte Sunscreen (Acne UV)"],
-        "Combination":["🧼 Gentle Cleanser","💧 Niacinamide/Hydration based","🧴 Lightweight Moisturizer (Episoft)","☀️ Non-greasy Sunscreen (UV Doux)"],
-        "Normal":["🧼 Gentle Cleanser","💧 Vitamin C/Niacinamide","🧴 Light Moisturizer","☀️ Sunscreen (UV Doux/Cetaphil)"],
-        "Sensitive":["🧼 Gentle Fragrance-Free Cleanser","💧 Aloe/Panthenol Serum","🧴 Barrier Repair Moisturizer","☀️ Mineral Sunscreen"]
+        "Dry":["🧼 Hydrating Cleanser","💧 Hyaluronic Serum","🧴 Ceramide Moisturizer","☀️ Cream Sunscreen"],
+        "Oily":["🧼 Gel Cleanser","💧 Niacinamide","🧴 Oil-free Moisturizer","☀️ Matte Sunscreen"],
+        "Combination":["🧼 Gentle Cleanser","💧 Niacinamide","🧴 Light Moisturizer","☀️ Non-greasy Sunscreen"],
+        "Normal":["🧼 Gentle Cleanser","💧 Vitamin C","🧴 Moisturizer","☀️ Sunscreen"]
     }
 
     diet = {
-        "Dry":["💧 Drink at least 2-3 liters of water daily","🥑 Eat healthy fats (avocado, nuts, seeds, ghee)","🥜 Include omega-3 foods (flax seeds, walnuts)","🚫 Avoid excess caffeine and alcohol"],
-        "Oily":["❌ Avoid sugary, fried, junk food","🍎 Eat low-glycemic foods (veggies, whole grains)","🌰 Include zinc-rich foods (pumpkin seeds, nuts)","🍵 Drink green tea or detox drinks"],
-        "Combination":["🍽️ Balanced diet (carbs + protein + healthy fats)","🍓 Eat fresh fruits and veggies","💦 Stay well hydrated","🚫 Limit processed and oily foods"],
-        "Normal":["💧 Drink 2-3 liters of water","🥗 Eat vitamin-rich foods","🍽️ Maintain balanced diet","🚫 Avoid excess junk or sugar"],
-        "Sensitive":["🌿 Eat anti-inflammatory foods (turmeric, ginger)","🥛 Include probiotics (curd, yogurt)","🚫 Avoid spicy processed foods","🍓 Eat antioxidant-rich foods (berries, leafy greens)"]
+        "Dry":["💧 More water","🥑 Healthy fats","🥜 Omega-3","🚫 Less caffeine"],
+        "Oily":["❌ No junk","🍎 Low GI foods","🌰 Zinc","🍵 Green tea"],
+        "Combination":["🍽️ Balanced diet","🍓 Fruits","💦 Hydration","🚫 Less oil"],
+        "Normal":["💧 Water","🥗 Clean food","🍽️ Balance","🚫 Less junk"]
     }
 
-    roasts = {
-        "Dry":"💀 YOUR SKIN IS SO DRY, IT'S LITERALLY SCREAMING FOR HYDRATION 💧",
-        "Oily":"😭 YOUR SKIN LOVES TO BE EXTRA, A LITTLE TOO EXTRA OILY 🛢️",
-        "Combination":"😵‍💫 YOUR SKIN CAN'T DECIDE WHAT IT WANTS",
-        "Normal":"😎 YOUR SKIN IS SO UNPROBLEMATIC, IT'S HONESTLY HELLACIOUS ✨",
-        "Sensitive":"⚡ YOUR SKIN REACTS FASTER THAN YOU IN ARGUMENTS 😭"
+    roast = {
+        "Dry":"💀 YOUR SKIN IS THIRSTY AF 💧",
+        "Oily":"😭 OIL FACTORY RUNNING FULL TIME 🛢️",
+        "Combination":"😵 YOUR SKIN IS CONFUSED BRO",
+        "Normal":"😎 SKIN FLEX LEVEL MAX ✨"
     }
 
-    html=f"<h2>SKIN TYPE: {skin}</h2>"
-    html+=f"<h2>SKIN SCORE: {score}/100</h2>"
-    html+=f"<h3>CONFIDENCE: {confidence}%</h3>"
-    if lighting_msg:
-        html+=f"<p>{lighting_msg}</p>"
-    html+=f"<div style='background:#333;height:20px;border-radius:10px;'><div style='width:{score}%;background:lime;height:100%;'></div></div>"
+    html=f"<h2>{skin} SKIN</h2><h2>{score}/100</h2>"
+
     if concerns:
-        html+="<h3>SKIN CONCERNS</h3><ul>"+''.join(f"<li>{c}</li>" for c in concerns)+"</ul>"
-    if explanations:
-        html+="<h3>AI ANALYSIS</h3><ul>"+''.join(f"<li>{e}</li>" for e in explanations)+"</ul>"
-    html+="<h3>PRODUCT RECOMMENDATIONS</h3>"
-    for p in products[skin]:
-        html+=p+"<br>"
+        html+="<ul>"+''.join(f"<li>{c}</li>" for c in concerns)+"</ul>"
+
+    html+="<ul>"+''.join(f"<li>{e}</li>" for e in explanations)+"</ul>"
+
+    html+="<h3>PRODUCTS</h3>"+'<br>'.join(products[skin])
+    html+="<h3>DIET</h3><ul>"+''.join(f"<li>{d}</li>" for d in diet[skin])+"</ul>"
+
     if "LIP PIGMENTATION 💄" in concerns:
-        html+="💄 Brightening SPF50 PA++++ Lip Balm<br>"
+        html+="💄 Lip Balm<br>"
     if "DARK CIRCLES 👁️" in concerns:
-        html+="👁️ Caffeine / Retinol Eye Cream<br>"
-    html+="<h3>DIET RECOMMENDATIONS</h3><ul>"+''.join(f"<li>{d}</li>" for d in diet[skin])+"</ul>"
-    html+=f"<p>{roasts[skin]}</p>"
+        html+="👁️ Eye Cream<br>"
+
+    html+=f"<p>{roast[skin]}</p>"
+
     return jsonify({"html":html})
 
-if __name__=="__main__":
-    app.run(debug=True)
+
+if __name__ == "__main__":
+    app.run(port=5001, debug=False)
